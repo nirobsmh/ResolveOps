@@ -1,4 +1,9 @@
-"""Run one support ticket through the graph and print its live execution trace."""
+"""Run one support ticket through the graph and print its live execution trace.
+
+Default path uses RuleBasedReasoner (no API key). --llm swaps in OpenAIReasoner.
+Streaming stream_mode="updates" prints each node as it completes; get_state then
+dumps the final checkpoint for inspection.
+"""
 
 import argparse
 import json
@@ -16,6 +21,7 @@ DEFAULT_TICKET = (
 
 
 def _serialize(value: object) -> object:
+    """Recursively turn Pydantic models (if any) into JSON-serializable dicts."""
     if hasattr(value, "model_dump"):
         return value.model_dump()  # type: ignore[union-attr]
     if isinstance(value, list):
@@ -26,6 +32,7 @@ def _serialize(value: object) -> object:
 
 
 def main() -> None:
+    """Parse CLI args, build the graph, stream node updates, print final state."""
     parser = argparse.ArgumentParser(description="Run the ResolveOps Day 1 graph")
     parser.add_argument("--ticket", default=DEFAULT_TICKET, help="Ticket body")
     parser.add_argument("--subject", default="Duplicate charge and invoice export failure")
@@ -40,12 +47,14 @@ def main() -> None:
         reasoner = RuleBasedReasoner()
 
     graph = build_graph(reasoner)
+    # Unique thread_id isolates this run's checkpoint from other concurrent tickets.
     thread_id = f"ticket-{uuid.uuid4()}"
     config = {"configurable": {"thread_id": thread_id}}
     initial_state = {
         "ticket_id": "ticket_1001",
         "subject": args.subject,
         "body": args.ticket,
+        # Seed append-reducer lists so the first node does not merge into missing keys.
         "evidence": [],
         "trace": [],
         "status": "received",
@@ -53,6 +62,7 @@ def main() -> None:
 
     print("\nResolveOps execution\n")
     for update in graph.stream(initial_state, config=config, stream_mode="updates"):
+        # Each update is {node_name: partial_state_returned_by_that_node}.
         node_name, values = next(iter(update.items()))
         node_trace = values.get("trace", [])
         summary = node_trace[-1]["summary"] if node_trace else "completed"

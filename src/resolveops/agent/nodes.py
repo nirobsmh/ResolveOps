@@ -1,4 +1,9 @@
-"""Node factory. Dependencies are injected so orchestration stays testable."""
+"""Node factory. Dependencies are injected so orchestration stays testable.
+
+Each method is a LangGraph node: (state) -> partial state update. Nodes never
+mutate state in place; they return only the keys they own. Trace events always
+append so the CLI can print a live audit trail.
+"""
 
 from pathlib import Path
 
@@ -9,15 +14,27 @@ from resolveops.state import AgentState
 
 
 def _trace(stage: str, summary: str, **details: object) -> dict[str, object]:
+    """Build a TraceEvent dict ready to append into AgentState.trace."""
     return TraceEvent(stage=stage, summary=summary, details=details).model_dump()
 
 
 class AgentNodes:
+    """Bound methods used as graph nodes; holds injectable collaborators.
+
+    reasoner: triage / diagnose / plan (deterministic or LLM).
+    cloudesk: read-only account, payment, and log adapter (becomes MCP on Day 3).
+    """
+
     def __init__(self, reasoner: Reasoner, cloudesk: MockCloudDeskService) -> None:
         self.reasoner = reasoner
         self.cloudesk = cloudesk
 
     def triage_ticket(self, state: AgentState) -> dict[str, object]:
+        """Classify the ticket before any tool calls.
+
+        Runs first so investigation knows which customer to look up and which
+        issue types to pursue. Writes triage + status; appends one trace event.
+        """
         triage = self.reasoner.triage(state["subject"], state["body"])
         return {
             "triage": triage.model_dump(),
@@ -33,6 +50,13 @@ class AgentNodes:
         }
 
     def investigate_customer(self, state: AgentState) -> dict[str, object]:
+        """Pull account, invoices, payments, and logs; materialize Evidence facts.
+
+        Re-validates triage from state (dict → Pydantic) at the boundary.
+        Duplicate-payment detection is ordinary code over payment rows — not the
+        LLM — so the finding is deterministic and citeable. Missing customers
+        still return a partial update today (routing to escalate is Exercise 2).
+        """
         triage = TriageResult.model_validate(state["triage"])
         customer = self.cloudesk.find_customer_by_name(triage.customer_name)
         if not customer:
@@ -63,6 +87,7 @@ class AgentNodes:
                 fact=f"Customer is active on the {customer['plan']} plan.",
             )
         ]
+        # Heuristic: two succeeded payments with same invoice + amount ⇒ duplicate charge.
         if len(payments) >= 2:
             first, second = payments[0], payments[1]
             same_charge = (
@@ -108,6 +133,12 @@ class AgentNodes:
         }
 
     def retrieve_policy(self, state: AgentState) -> dict[str, object]:
+        """Load local markdown policies that match keyword filters.
+
+        Day-1 stand-in for hybrid retrieval (pgvector + keyword + rerank on Day 2).
+        Matching passages are both stored as policy_passages and appended as
+        Evidence so diagnosis can cite policy text.
+        """
         knowledge_dir = Path(__file__).resolve().parents[3] / "data" / "knowledge"
         passages = []
         evidence = []
@@ -137,6 +168,7 @@ class AgentNodes:
         }
 
     def analyze_root_cause(self, state: AgentState) -> dict[str, object]:
+        """Ask the reasoner to turn accumulated evidence into a RootCause object."""
         triage = TriageResult.model_validate(state["triage"])
         evidence = [Evidence.model_validate(item) for item in state.get("evidence", [])]
         root_cause = self.reasoner.analyze(triage, evidence)
@@ -153,6 +185,7 @@ class AgentNodes:
         }
 
     def generate_resolution_plan(self, state: AgentState) -> dict[str, object]:
+        """Ask the reasoner for a ResolutionPlan — proposals only, no side effects yet."""
         triage = TriageResult.model_validate(state["triage"])
         root_cause = RootCause.model_validate(state["root_cause"])
         plan = self.reasoner.plan(triage, root_cause)
@@ -169,6 +202,12 @@ class AgentNodes:
         }
 
     def policy_guard(self, state: AgentState) -> dict[str, object]:
+        """Deterministic authorization gate — the model proposes, this code decides.
+
+        Flags financial / external actions (and any high-risk action) as needing
+        human approval. Does not execute anything; later days pause here with
+        LangGraph interrupt/resume before tools with side effects run.
+        """
         sensitive = {"issue_account_credit", "send_customer_email"}
         plan = ResolutionPlan.model_validate(state["resolution_plan"])
         blocked_actions = [
